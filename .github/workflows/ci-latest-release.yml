@@ -1,39 +1,37 @@
-name: Build and publish KubeArmor Relay Image
+name: Fork validation - Docker Hub publish, sign and native smoke tests
 
 on:
   push:
-    branches: [main, v*]
-
-    paths:
-      - "relay-server/**"
-      - "!STABLE-RELEASE"
-      - ".github/workflows/ci-latest-release.yml"
-      - ".dockerignore"
-
-  pull_request:
-    branches: [main]
-    paths:
-      - "relay-server/**"
-      - ".github/workflows/ci-latest-release.yml"
-      - ".dockerignore"
-
-  # Manual runs validate the multi-platform build without publishing.
-  workflow_dispatch:
-
-  create:
+    branches: [CNAPP-33972-validation]
 
 permissions:
   contents: read
 
+env:
+  TEST_IMAGE: sanskardevops/kubearmor-relay-server
+
 concurrency:
-  group: relay-image-${{ github.ref }}
+  group: relay-fork-validation-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
+  registry-access:
+    name: Check Docker Hub credential is configured
+    if: github.repository == 'Sanskarzz/kubearmor-relay-server'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require Docker Hub write credential
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKER_AUTHTOK }}
+        run: |
+          if [ -z "$DOCKERHUB_TOKEN" ]; then
+            echo "::error::Add DOCKER_AUTHTOK to the fork's Actions secrets, then rerun this workflow."
+            exit 1
+          fi
   build-native:
     name: Build native ${{ matrix.arch }} image
-    # The create event has no branch filters; only version branches release images.
-    if: github.event_name != 'create' || (github.event.ref_type == 'branch' && startsWith(github.event.ref, 'v'))
+    if: github.repository == 'Sanskarzz/kubearmor-relay-server'
     strategy:
       fail-fast: false
       matrix:
@@ -69,13 +67,14 @@ jobs:
 
   push-docker-img:
     name: Assemble multi-platform image
-    needs: build-native
+    needs: [build-native, registry-access]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     outputs:
       digest: ${{ steps.build.outputs.digest }}
+      version: ${{ steps.tag.outputs.tag }}
     env:
-      PUBLISH: ${{ github.repository == 'kubearmor/kubearmor-relay-server' && (github.event_name == 'push' || github.event_name == 'create') }}
+      PUBLISH: ${{ github.repository == 'Sanskarzz/kubearmor-relay-server' && github.event_name == 'push' && github.ref == 'refs/heads/CNAPP-33972-validation' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -111,21 +110,13 @@ jobs:
         if: env.PUBLISH == 'true'
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKER_USERNAME }}
+          username: sanskardevops
           password: ${{ secrets.DOCKER_AUTHTOK }}
 
       - name: Get image tag
         id: tag
         run: |
-          if [ "$GITHUB_REF" == "refs/heads/main" ]; then
-            TAG=latest
-          else
-            TAG=${GITHUB_REF#refs/*/}
-          fi
-          # Pull request refs contain slashes and cannot be Docker tags.
-          if [ "$GITHUB_EVENT_NAME" == "pull_request" ] || [ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]; then
-            TAG=ci
-          fi
+          TAG=cnapp33972-${GITHUB_SHA:0:12}
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Assemble image from native caches
@@ -137,7 +128,7 @@ jobs:
           platforms: linux/amd64,linux/arm64/v8
           push: ${{ env.PUBLISH == 'true' }}
           outputs: ${{ env.PUBLISH != 'true' && format('type=oci,dest={0}/relay-image.tar', runner.temp) || '' }}
-          tags: kubearmor/kubearmor-relay-server:${{ steps.tag.outputs.tag }}
+          tags: ${{ env.TEST_IMAGE }}:${{ steps.tag.outputs.tag }}
           build-args: |
             BUILDKIT_MULTI_PLATFORM=1
             VERSION=${{ steps.tag.outputs.tag }}
@@ -148,7 +139,7 @@ jobs:
   sign-image:
     name: Sign published image
     needs: push-docker-img
-    if: github.repository == 'kubearmor/kubearmor-relay-server' && (github.event_name == 'push' || github.event_name == 'create')
+    if: github.repository == 'Sanskarzz/kubearmor-relay-server' && github.event_name == 'push' && github.ref == 'refs/heads/CNAPP-33972-validation'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -158,7 +149,7 @@ jobs:
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKER_USERNAME }}
+          username: sanskardevops
           password: ${{ secrets.DOCKER_AUTHTOK }}
 
       - name: Install Cosign
@@ -168,50 +159,93 @@ jobs:
         env:
           IMAGE_DIGEST: ${{ needs.push-docker-img.outputs.digest }}
         run: |
-          cosign sign -r "kubearmor/kubearmor-relay-server@$IMAGE_DIGEST" --yes
+          cosign sign -r "$TEST_IMAGE@$IMAGE_DIGEST" --yes
 
-  push-stable-version:
-    name: Create kubearmor-relay stable release
-    needs: sign-image
-    if: github.ref != 'refs/heads/main'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    timeout-minutes: 30
+      - name: Verify published architectures and signature
+        env:
+          IMAGE_DIGEST: ${{ needs.push-docker-img.outputs.digest }}
+        run: |
+          docker buildx imagetools inspect --raw "$TEST_IMAGE@$IMAGE_DIGEST" > manifest.json
+          jq -e '[.manifests[].platform | select(.os == "linux") | .architecture] | sort == ["amd64", "arm64"]' manifest.json
+          cosign verify "$TEST_IMAGE@$IMAGE_DIGEST" \
+            --certificate-identity "https://github.com/Sanskarzz/kubearmor-relay-server/.github/workflows/ci-latest-release.yml@refs/heads/CNAPP-33972-validation" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            > signatures.json
+          cat manifest.json
+          cat signatures.json
+          echo "Published and verified: $TEST_IMAGE@$IMAGE_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save manifest and signature verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dockerhub-manifest-and-signature-evidence
+          path: |
+            manifest.json
+            signatures.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  verify-native:
+    name: Pull and smoke test published ${{ matrix.arch }} image
+    needs: [push-docker-img, sign-image]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64/v8
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    env:
+      IMAGE_DIGEST: ${{ needs.push-docker-img.outputs.digest }}
+      IMAGE_VERSION: ${{ needs.push-docker-img.outputs.version }}
+      ARCH: ${{ matrix.arch }}
+      PLATFORM: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v3
-        with:
-          ref: main
-
-      - name: Install regctl
-        run: |
-          curl -L https://github.com/regclient/regclient/releases/latest/download/regctl-linux-amd64 >regctl
-          chmod 755 regctl
-          mv regctl /usr/local/bin
-
-      - name: Check install
-        run: regctl version
-
-      - name: Get tag
-        id: match
-        run: |
-          value=`cat STABLE-RELEASE`
-          if [ ${{ github.ref }} == "refs/heads/$value" ]; then
-            echo "tag=true" >> $GITHUB_OUTPUT
-          else
-            echo "tag=false" >> $GITHUB_OUTPUT
-          fi
-
       - name: Login to Docker Hub
-        if: steps.match.outputs.tag == 'true'
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKER_USERNAME }}
+          username: sanskardevops
           password: ${{ secrets.DOCKER_AUTHTOK }}
 
-      - name: Generate the stable version of kubearmor-relay in Docker Hub
-        if: steps.match.outputs.tag == 'true'
+      - name: Pull exact digest and validate image configuration
         run: |
-          STABLE_VERSION=`cat STABLE-RELEASE`
-          regctl image copy kubearmor/kubearmor-relay-server:$STABLE_VERSION kubearmor/kubearmor-relay-server:stable --digest-tags
-          
+          ref="$TEST_IMAGE@$IMAGE_DIGEST"
+          docker pull --platform "$PLATFORM" "$ref"
+          test "$(docker image inspect "$ref" --format '{{.Architecture}}')" = "$ARCH"
+          test "$(docker image inspect "$ref" --format '{{.Config.User}}')" = default
+          test "$(docker image inspect "$ref" --format '{{index .Config.Labels "version"}}')" = "$IMAGE_VERSION"
+          test "$(docker image inspect "$ref" --format '{{index .Config.Labels "release"}}')" = "$IMAGE_VERSION"
+          docker run --rm --platform "$PLATFORM" --entrypoint /bin/sh "$ref" -ec '
+            test "$(id -u)" = 1000
+            . /etc/os-release
+            test "$ID" = rhel
+            case "$VERSION_ID" in 10|10.*) ;; *) exit 1 ;; esac
+            /KubeArmor/kubearmor-relay-server --help
+          '
+
+      - name: Smoke test relay startup on its native architecture
+        run: |
+          ref="$TEST_IMAGE@$IMAGE_DIGEST"
+          trap 'docker logs relay-smoke; docker rm -f relay-smoke >/dev/null' EXIT
+          docker run --detach --name relay-smoke --platform "$PLATFORM" \
+            -p 127.0.0.1:32767:32767 "$ref"
+          for attempt in $(seq 1 30); do
+            test "$(docker inspect --format '{{.State.Running}}' relay-smoke)" = true
+            if docker logs relay-smoke 2>&1 | grep -q 'Started to serve gRPC-based log feeds'; then
+              break
+            fi
+            sleep 1
+          done
+          docker logs relay-smoke 2>&1 | grep 'Started to serve gRPC-based log feeds'
+          python3 - <<'CHECK'
+          import socket
+          with socket.create_connection(("127.0.0.1", 32767), timeout=5):
+              print("Relay TCP listener is reachable")
+          CHECK
+          echo "Validated native $ARCH: UBI10, version labels, UID 1000, executable startup and listening socket" >> "$GITHUB_STEP_SUMMARY"

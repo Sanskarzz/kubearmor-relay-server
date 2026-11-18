@@ -1,26 +1,22 @@
-name: Diagnose emulated arm64 image build
+name: Fork validation - diagnose emulated arm64 image build
 
 on:
-  workflow_dispatch:
-    inputs:
-      ref:
-        description: Commit or ref to reproduce (defaults to the amd64 workaround)
-        default: 31bc6aabd2c7c4825ccb9b843d341050988a0409
-        required: true
-        type: string
+  push:
+    branches: [CNAPP-33972-validation]
 
 permissions:
   contents: read
 
 jobs:
   reproduce:
+    if: github.repository == 'Sanskarzz/kubearmor-relay-server'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - name: Checkout source to reproduce
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref }}
+          ref: 31bc6aabd2c7c4825ccb9b843d341050988a0409
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -36,7 +32,7 @@ jobs:
       - name: Reproduce arm64 build with full output
         run: |
           set -o pipefail
-          docker buildx build --no-cache --progress=plain \
+          timeout 35m docker buildx build --no-cache --progress=plain \
             --platform linux/arm64/v8 --output type=cacheonly \
             --file relay-server/Dockerfile . \
             2>&1 | tee "$RUNNER_TEMP/arm64-build.log"
